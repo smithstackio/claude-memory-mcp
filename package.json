@@ -1,0 +1,28 @@
+{
+  "name": "claude-memory-mcp",
+  "version": "1.0.0",
+  "description": "Semantic code search MCP server backed by Supabase pgvector",
+  "type": "module",
+  "bin": {
+    "claude-memory-server": "./dist/server.js",
+    "claude-memory-index": "./dist/indexer.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "index": "node dist/indexer.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@supabase/supabase-js": "^2.99.2",
+    "commander": "^14.0.3",
+    "dotenv": "^17.3.1",
+    "fast-glob": "^3.3.3",
+    "ignore": "^7.0.5",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3"
+  }
+}
