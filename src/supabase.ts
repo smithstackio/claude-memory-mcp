@@ -7,18 +7,46 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: join(__dirname, "..", ".env") });
 
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+const serviceKey = process.env.SUPABASE_SERVICE_KEY;
+const anonKey = process.env.SUPABASE_ANON_KEY;
+const projectToken = process.env.PROJECT_TOKEN;
 
-if (!supabaseUrl || !supabaseKey) {
-  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in .env");
+if (!supabaseUrl) {
+  throw new Error("Missing SUPABASE_URL");
 }
 
-const supabase: SupabaseClient = createClient(supabaseUrl, supabaseKey);
+// Service client for indexer (full access, bypasses RLS)
+const serviceClient: SupabaseClient | null = serviceKey
+  ? createClient(supabaseUrl, serviceKey)
+  : null;
+
+// Anon client for MCP server (scoped via RPC + token)
+const anonClient: SupabaseClient | null = anonKey
+  ? createClient(supabaseUrl, anonKey)
+  : null;
+
+function getServiceClient(): SupabaseClient {
+  if (!serviceClient) throw new Error("Missing SUPABASE_SERVICE_KEY (required for indexer)");
+  return serviceClient;
+}
+
+function getAnonClient(): SupabaseClient {
+  if (!anonClient) throw new Error("Missing SUPABASE_ANON_KEY (required for MCP server)");
+  return anonClient;
+}
+
+function getProjectToken(): string {
+  if (!projectToken) throw new Error("Missing PROJECT_TOKEN (required for MCP server)");
+  return projectToken;
+}
+
+// --- Write functions (indexer, uses service_role) ---
 
 export async function clearProject(project: string): Promise<void> {
-  await supabase.from("code_chunks").delete().eq("project", project);
-  await supabase.from("file_summaries").delete().eq("project", project);
-  await supabase.from("codebase_maps").delete().eq("project", project);
+  const db = getServiceClient();
+  await db.from("code_chunks").delete().eq("project", project);
+  await db.from("file_summaries").delete().eq("project", project);
+  await db.from("codebase_maps").delete().eq("project", project);
 }
 
 export async function upsertChunks(
@@ -32,10 +60,10 @@ export async function upsertChunks(
     embedding: number[];
   }>
 ): Promise<void> {
-  // Batch insert in groups of 500
+  const db = getServiceClient();
   for (let i = 0; i < chunks.length; i += 500) {
     const batch = chunks.slice(i, i + 500);
-    const { error } = await supabase.from("code_chunks").insert(batch);
+    const { error } = await db.from("code_chunks").insert(batch);
     if (error) throw new Error(`Failed to insert chunks: ${error.message}`);
   }
 }
@@ -44,7 +72,8 @@ export async function deleteFileChunks(
   project: string,
   filePath: string
 ): Promise<void> {
-  await supabase
+  const db = getServiceClient();
+  await db
     .from("code_chunks")
     .delete()
     .eq("project", project)
@@ -56,7 +85,8 @@ export async function upsertFileSummary(
   filePath: string,
   summary: string
 ): Promise<void> {
-  const { error } = await supabase.from("file_summaries").upsert(
+  const db = getServiceClient();
+  const { error } = await db.from("file_summaries").upsert(
     {
       project,
       file_path: filePath,
@@ -72,7 +102,8 @@ export async function upsertCodebaseMap(
   project: string,
   mapJson: Record<string, unknown>
 ): Promise<void> {
-  const { error } = await supabase.from("codebase_maps").upsert(
+  const db = getServiceClient();
+  const { error } = await db.from("codebase_maps").upsert(
     {
       project,
       map_json: mapJson,
@@ -83,8 +114,9 @@ export async function upsertCodebaseMap(
   if (error) throw new Error(`Failed to upsert map: ${error.message}`);
 }
 
+// --- Read functions (MCP server, uses anon + project token) ---
+
 export async function searchChunks(
-  project: string,
   queryEmbedding: number[],
   limit: number = 10
 ): Promise<
@@ -99,43 +131,52 @@ export async function searchChunks(
     similarity: number;
   }>
 > {
-  const { data, error } = await supabase.rpc("match_code_chunks", {
+  const db = getAnonClient();
+  const { data, error } = await db.rpc("search_code_chunks", {
+    project_token: getProjectToken(),
     query_embedding: JSON.stringify(queryEmbedding),
-    match_project: project,
     match_count: limit,
   });
   if (error) throw new Error(`Search failed: ${error.message}`);
   return data ?? [];
 }
 
-export async function getCodebaseMap(
-  project: string
-): Promise<Record<string, unknown> | null> {
-  const { data, error } = await supabase
-    .from("codebase_maps")
-    .select("map_json")
-    .eq("project", project)
-    .single();
+export async function getCodebaseMap(): Promise<Record<string, unknown> | null> {
+  const db = getAnonClient();
+  const { data, error } = await db.rpc("get_codebase_map_secure", {
+    project_token: getProjectToken(),
+  });
   if (error) return null;
-  return data?.map_json ?? null;
+  return data ?? null;
 }
 
 export async function getFileSummary(
-  project: string,
   filePath: string
 ): Promise<string | null> {
-  const { data, error } = await supabase
-    .from("file_summaries")
-    .select("summary")
-    .eq("project", project)
-    .eq("file_path", filePath)
-    .single();
+  const db = getAnonClient();
+  const { data, error } = await db.rpc("get_file_summary_secure", {
+    project_token: getProjectToken(),
+    target_file_path: filePath,
+  });
   if (error) return null;
-  return data?.summary ?? null;
+  return data ?? null;
 }
 
+export async function getProjectInfo(): Promise<string | null> {
+  const db = getAnonClient();
+  const { data, error } = await db.rpc("get_project_info", {
+    project_token: getProjectToken(),
+  });
+  if (error) throw new Error(`Failed to get project info: ${error.message}`);
+  if (!data || data.length === 0) return null;
+  return data[0].project;
+}
+
+// --- Indexer-only: list all projects (service_role) ---
+
 export async function listProjects(): Promise<string[]> {
-  const { data, error } = await supabase
+  const db = getServiceClient();
+  const { data, error } = await db
     .from("code_chunks")
     .select("project")
     .limit(1000);
